@@ -1080,3 +1080,105 @@ indices applied to both models' predictions, testing the sign of the
 difference), which has not been run. Treat "LightGBM beats RF on this
 data" as a point-estimate observation, not a statistically established
 one, until that's done.
+
+## D31 — Step 5 decision-layer design: cost-ratio threshold sweep + expected-loss pricing (2026-10-15)
+
+Design-only entry — this records the decided logic for the step 5
+decision layer (SPEC.md "Credit decision & pricing") before
+`scripts/decision_layer.py` exists; the real numbers, once the script is
+built and run, get their own follow-up entry (this project's convention
+per D27: a later finding gets a new entry, not an edit to this one).
+
+**Approve/decline — Bayes-cost threshold, not a 0.5 cutoff.** For an
+applicant with predicted P(default)=p, the expected cost of approving is
+p·C_FN (C_FN = cost of a missed bad payer — lost principal); the expected
+cost of declining is (1-p)·C_FP (C_FP = opportunity cost of a lost good
+payer — foregone margin). Approve iff p·C_FN < (1-p)·C_FP, which solves to
+
+  p < C_FP / (C_FP + C_FN) =: t*
+
+Only the ratio of the two costs matters, not their scale, so reparametrize
+as k = C_FN/C_FP ("a missed default costs k times a missed good loan"):
+t* = 1/(1+k). Since C_FN is typically >> C_FP in lending, t* sits well
+below 0.5 — at this dataset's ~8% base rate, plausible k (3-20) puts t*
+in roughly the 0.05-0.25 range.
+
+Per SPEC.md ("the model does not make the business decision"), k is a
+stated assumption, never fit from data — sweep k over {3, 5, 10, 20},
+compute t*(k) in closed form for each, and report a cost curve: approval
+rate, bad-rate-among-approved, and expected cost per applicant, at each
+t*(k), against the frozen held-out test predictions.
+
+**Leakage guard, stated explicitly because it's easy to get backwards:**
+computing t* from a stated k and then applying it to test predictions is
+not a new look at the test set — t* never depends on y_test. Scanning a
+grid of raw thresholds and keeping whichever minimizes *empirical* test
+cost would be a second, test-set-informed "fit," the same leakage D29
+fixed in preprocessing, just relocated to the decision layer. The
+implementation must compute every t* before ever touching y_test, not
+search for one against it.
+
+**Pricing ("how much") — expected-loss pricing, solved for rate, not just
+stated as a value.** Expected portfolio value per unit lent at rate r is
+(1-p)(1+r) - p·LGD (full repayment+interest if good, LGD-fraction loss if
+bad, recoveries folded into LGD). Setting this to a target return 1+m and
+solving for r:
+
+  (1-p)(1+r) - p·LGD = 1 + m
+  r* = [m + p·(1+LGD)] / (1-p)
+
+Limits check out: p→0 gives r*→m (zero risk, charge just the target
+margin); p→1 gives r*→∞ (no finite rate prices out a near-certain
+default — decline, don't reprice). This is the same expected-value logic
+as the threshold above, not a second mechanism: declining is the limiting
+case where r* becomes infeasible (negative margin, or above any rate a
+borrower would accept).
+
+**LGD and m are stated, not fit** — there is no recovery/collections data
+in this dataset (application-level table only, D1), so LGD cannot be
+estimated, only assumed. Home Credit's loans are largely unsecured
+consumer credit (no collateral to recover against), where a 50-85% LGD
+range is typical in the literature; sweep LGD over {0.5, 0.6, 0.7, 0.8,
+0.9, 1.0} (every 0.1, not just the three original anchor points) — this
+sweep is pure arithmetic over an already-computed p (D31), not a
+retrain, so there is no cost reason to coarsen it, and a 0.1 LGD step is
+cheap insurance against a reader fixating on one value instead of the
+shape of the dependence. m (target margin) is a pure
+business choice, not an empirically uncertain quantity the way LGD is —
+expose it as a CLI flag, default 0.05, not swept.
+
+**Validation against real data, not just a formula in a vacuum**: this
+dataset is already-disbursed loans, so `AMT_ANNUITY/AMT_CREDIT` is each
+applicant's actual historical implied periodic rate (D7's proxy — not a
+clean APR, term length isn't separable from rate in this ratio). Compare
+r* against that real column for test-set applicants: does the bank's
+existing pricing already move with predicted p the way r* implies? A null
+result (little correlation) is a legitimate finding, not something to
+suppress in favor of a cleaner-looking synthetic result.
+
+**Model and predictions used — decided by the numbers already in hand, not
+re-opened as a new choice.** LightGBM's uncalibrated test-set probabilities:
+Brier=0.0676, the lowest of all four evaluated variants (RF
+none/isotonic/sigmoid = 0.0688/0.0682/0.0686), and PR-AUC=0.2480, also the
+highest. Calibration is load-bearing for this step (SPEC.md), so Brier is
+the deciding criterion, not PR-AUC alone — both happen to agree here, so
+no tension to adjudicate.
+
+**No new model-persistence mechanism** — neither training script saves a
+fitted model object or raw test-set predictions under `--final`.
+`decision_layer.py` imports `load_dataset`/`split_holdout`/`build_model`
+from `train_lightgbm.py` (same pattern `grid_search_random_forest.py`
+already uses against `train_random_forest.py`) and refits directly —
+deterministic given the fixed hyperparameters and `RANDOM_STATE`, so this
+is the same model, not a second copy that can drift from it.
+`split_holdout` doesn't reset the index, so `df.loc[X_test.index,
+["SK_ID_CURR", "AMT_CREDIT", "AMT_ANNUITY"]]` recovers the real test-set
+applicants' loan terms for the pricing-validation step above with no join
+logic needed.
+
+**Deferred, on purpose, per explicit instruction**: how the D28 caveat
+(protected attributes feed p with no fairness audit, so every threshold/
+price here inherits that) gets physically attached to whatever the
+decision layer outputs — a footnote on a table, a printed line, wherever
+— is a publication/presentation question, decided once real results
+exist, not before.

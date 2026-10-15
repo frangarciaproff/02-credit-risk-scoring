@@ -1,0 +1,309 @@
+"""Step 5 decision layer — SPEC.md Plan step 5 ("Credit decision & pricing").
+
+Design decided in docs/DECISIONS.md D31; this is the implementation.
+Turns the already-decided LightGBM model's held-out test-set
+probabilities into (a) an approve/decline cost-ratio sweep and (b) an
+expected-loss pricing check against this dataset's own historical implied
+rate — nothing more. Per SPEC.md's "Credit decision & pricing": the model
+does not make the business decision, this illustrates the framework for
+a stated cost structure, it does not prescribe one.
+
+Reuses train_lightgbm.py's load_dataset/split_holdout/build_model/
+_fit_with_optional_early_stopping/_bootstrap_ci directly (D31) rather than
+duplicating them or introducing a new model-persistence mechanism — this
+refits the exact same model (same hyperparameters, same RANDOM_STATE),
+not a second copy that can drift from the one already evaluated in
+results/model_runs.csv. Only runs as a module (see Usage) for the same
+reason grid_search_random_forest.py does: `scripts.train_lightgbm` has to
+be importable, which needs the project root on sys.path.
+
+Approve/decline (D31): for predicted P(default)=p, the Bayes-cost
+threshold is t* = 1/(1+k), k = C_FN/C_FP (how many times worse a missed
+default is than a missed good loan) — derived, not fit. Every t*(k) is
+computed before this script ever reads y_test, and the cost-ratio sweep
+(--k-values) is stated externally, never searched for against test-set
+outcomes: scanning raw thresholds for whichever minimizes empirical test
+cost would be exactly the D29 leak relocated here. bayes_threshold()
+takes k as its only argument — nothing in this module threads y_test into
+a threshold computation.
+
+Pricing (D31): required rate r* = [m + p(1+LGD)] / (1-p), from setting
+expected value (1-p)(1+r) - p*LGD equal to a target return 1+m and solving
+for r. LGD has no empirical anchor in this dataset (no recovery data,
+application-level table only, D1) so it's swept (--lgd-values) rather
+than fit; m (target margin) is a stated business choice, exposed as a
+flag but not swept. Checked against this dataset's own historical implied
+rate (AMT_ANNUITY/AMT_CREDIT, D7's proxy — not a clean APR, loan term
+isn't separable from rate in this ratio) for the real test-set
+applicants, recovered via df.loc[X_test.index, ...] since split_holdout
+never resets the index — a real, data-grounded check, not just a formula
+asserted to work.
+
+Scope boundary carried from D28/SPEC.md, not re-litigated here: the
+model's p comes from a model that uses CODE_GENDER/DAYS_BIRTH/
+NAME_FAMILY_STATUS like any other feature, with no fairness audit — every
+number this script prints inherits that. How that caveat gets physically
+attached to published results is deferred on purpose (D31) until real
+output exists to attach it to.
+
+Usage:
+    uv run python -m scripts.decision_layer
+    uv run python -m scripts.decision_layer --k-values 5,10 --lgd-values 0.6,0.8
+"""
+
+import argparse
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy import stats as scipy_stats
+
+from scripts.train_lightgbm import (
+    _bootstrap_ci,
+    _fit_with_optional_early_stopping,
+    build_model,
+    load_dataset,
+    split_holdout,
+)
+
+RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+
+DEFAULT_K_VALUES = "3,5,10,20"
+DEFAULT_LGD_VALUES = "0.5,0.6,0.7,0.8,0.9,1.0"
+DEFAULT_MARGIN = 0.05
+
+
+def _float_list(value: str) -> list[float]:
+    return [float(v) for v in value.split(",") if v.strip()]
+
+
+def bayes_threshold(k: float) -> float:
+    """t* = 1/(1+k), k = C_FN/C_FP (D31). A pure function of k — nothing
+    here ever reads y_test, which is the whole point.
+    """
+    return 1.0 / (1.0 + k)
+
+
+def required_rate(p: np.ndarray, lgd: float, margin: float) -> np.ndarray:
+    """r* = [m + p(1+LGD)] / (1-p) (D31). p is clipped just below 1.0 so
+    an edge-case probability doesn't produce a literal division by zero —
+    LightGBM's own output essentially never hits exactly 1.0, but letting
+    inf/nan through silently instead of clipping would be worse.
+    """
+    p_safe = np.clip(p, 0.0, 1.0 - 1e-9)
+    return (margin + p_safe * (1.0 + lgd)) / (1.0 - p_safe)
+
+
+def _realized_cost(y_true: np.ndarray, proba: np.ndarray, t: float, k: float) -> float:
+    """Realized policy cost per applicant, in units of C_FP (a missed
+    good loan costs 1; a missed default costs k). Measures an
+    already-decided threshold t against real outcomes — t is an argument
+    here, never something this function searches for.
+    """
+    approve = proba < t
+    n = len(y_true)
+    cost = np.sum(approve & (y_true == 1)) * k + np.sum(~approve & (y_true == 0)) * 1.0
+    return float(cost / n)
+
+
+def cost_curve(
+    y_true: np.ndarray, proba: np.ndarray, k_values: list[float]
+) -> pd.DataFrame:
+    """One row per k: the Bayes threshold, the realized outcome of
+    applying it to the real (already-computed) test predictions, a
+    bootstrap 95% CI on approval rate and realized cost (D30's own
+    resampling scheme, reused as-is — not a new mechanism), and the two
+    trivial baselines (approve everyone / decline everyone) for scale.
+    """
+    rows = []
+    for k in k_values:
+        t = bayes_threshold(k)
+        approve = proba < t
+        n = len(y_true)
+        n_approved = int(approve.sum())
+        n_declined = n - n_approved
+
+        bad_rate_among_approved = (
+            float(y_true[approve].mean()) if n_approved > 0 else float("nan")
+        )
+        good_rate_among_declined = (
+            float((1 - y_true[~approve]).mean()) if n_declined > 0 else float("nan")
+        )
+        realized_cost = _realized_cost(y_true, proba, t, k)
+
+        approval_rate_ci = _bootstrap_ci(
+            y_true, proba, lambda y, p, _t=t: float((p < _t).mean())
+        )
+        cost_ci = _bootstrap_ci(
+            y_true, proba, lambda y, p, _t=t, _k=k: _realized_cost(y, p, _t, _k)
+        )
+
+        rows.append(
+            {
+                "k": k,
+                "t_star": t,
+                "approval_rate": float(approve.mean()),
+                "approval_rate_ci95": json.dumps(list(approval_rate_ci)),
+                "bad_rate_among_approved": bad_rate_among_approved,
+                "good_rate_among_declined": good_rate_among_declined,
+                "realized_cost_per_applicant": realized_cost,
+                "realized_cost_ci95": json.dumps(list(cost_ci)),
+                "baseline_approve_all_cost": float((y_true == 1).mean() * k),
+                "baseline_decline_all_cost": float((y_true == 0).mean()),
+                "n_test": n,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def pricing_validation(
+    p: np.ndarray,
+    amt_credit: np.ndarray,
+    amt_annuity: np.ndarray,
+    lgd_values: list[float],
+    margin: float,
+) -> pd.DataFrame:
+    """Compares required_rate() against this dataset's own historical
+    implied rate (AMT_ANNUITY/AMT_CREDIT, D7's proxy) for the same
+    test-set applicants, per swept LGD — a real correlation check against
+    this dataset, not just a formula asserted to behave (D31). Rows with
+    a non-finite or non-positive AMT_CREDIT are dropped and counted.
+    """
+    valid = np.isfinite(amt_credit) & (amt_credit > 0) & np.isfinite(amt_annuity)
+    n_dropped = int((~valid).sum())
+    real_rate = amt_annuity[valid] / amt_credit[valid]
+    p_valid = p[valid]
+    # pearsonr/spearmanr raise below length 2 — real data has ~46k test
+    # rows so this never actually triggers, but guarded rather than
+    # assumed (same discipline as _bootstrap_ci's single-class guard).
+    enough_rows = valid.sum() >= 2
+
+    rows = []
+    for lgd in lgd_values:
+        r_star = required_rate(p_valid, lgd, margin)
+        if enough_rows:
+            pearson_r, pearson_p = scipy_stats.pearsonr(r_star, real_rate)
+            spearman_r, spearman_p = scipy_stats.spearmanr(r_star, real_rate)
+        else:
+            pearson_r = pearson_p = spearman_r = spearman_p = float("nan")
+        rows.append(
+            {
+                "lgd": lgd,
+                "margin": margin,
+                "n_applicants": int(valid.sum()),
+                "n_dropped_invalid_amt": n_dropped,
+                "median_r_star": float(np.median(r_star)),
+                "median_real_implied_rate": float(np.median(real_rate)),
+                "pearson_corr": float(pearson_r),
+                "pearson_p_value": float(pearson_p),
+                "spearman_corr": float(spearman_r),
+                "spearman_p_value": float(spearman_p),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--dataset", choices=["raw", "treated"], default="treated")
+    parser.add_argument("--n-jobs", type=int, default=-1)
+    parser.add_argument(
+        "--k-values", type=_float_list, default=_float_list(DEFAULT_K_VALUES)
+    )
+    parser.add_argument(
+        "--lgd-values", type=_float_list, default=_float_list(DEFAULT_LGD_VALUES)
+    )
+    parser.add_argument("--margin", type=float, default=DEFAULT_MARGIN)
+    # D31: the already-decided winning LightGBM configuration
+    # (results/model_runs.csv, the 2026-10-08T23:07:32Z uncalibrated row —
+    # lowest Brier AND highest PR-AUC of every evaluated variant) as
+    # defaults. This script evaluates the decided model; it doesn't
+    # re-search it.
+    parser.add_argument("--n-estimators", type=int, default=2000)
+    parser.add_argument("--learning-rate", type=float, default=0.05)
+    parser.add_argument("--num-leaves", type=int, default=31)
+    parser.add_argument("--max-depth", type=int, default=-1)
+    parser.add_argument("--min-child-samples", type=int, default=20)
+    parser.add_argument("--subsample", type=float, default=1.0)
+    parser.add_argument("--subsample-freq", type=int, default=0)
+    parser.add_argument("--colsample-bytree", type=float, default=0.5)
+    parser.add_argument("--reg-alpha", type=float, default=0.0)
+    parser.add_argument("--reg-lambda", type=float, default=0.0)
+    parser.add_argument("--is-unbalance", action="store_true")
+    parser.add_argument("--early-stopping-rounds", type=int, default=50)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    print(
+        f"Decision layer | dataset={args.dataset} | k_values={args.k_values} | "
+        f"lgd_values={args.lgd_values} | margin={args.margin}"
+    )
+
+    df = load_dataset(args.dataset)
+    X_train, X_test, y_train, y_test = split_holdout(df)
+    print(
+        f"Held out {len(X_test):,} rows for test (D6, same split "
+        f"train_lightgbm.py uses), {len(X_train):,} for fitting."
+    )
+
+    model = build_model(args, n_jobs=args.n_jobs)
+    idx = np.arange(len(X_train))
+    fit_idx, _ = _fit_with_optional_early_stopping(
+        model, X_train, y_train, idx, args, extra_holdout_needed=False
+    )
+    print(f"Fit on {len(fit_idx):,} rows (best_iteration={model.n_estimators_}).")
+
+    proba = model.predict_proba(X_test)[:, 1]
+    y_test_arr = np.asarray(y_test)
+
+    print("\nApprove/decline cost-ratio sweep (D31):")
+    curve = cost_curve(y_test_arr, proba, args.k_values)
+    for _, row in curve.iterrows():
+        print(
+            f"  k={row['k']:.0f}  t*={row['t_star']:.4f}  "
+            f"approval_rate={row['approval_rate']:.4f} {row['approval_rate_ci95']}  "
+            f"bad_rate|approved={row['bad_rate_among_approved']:.4f}  "
+            f"realized_cost={row['realized_cost_per_applicant']:.4f} "
+            f"{row['realized_cost_ci95']}  (baselines: "
+            f"approve_all={row['baseline_approve_all_cost']:.4f}, "
+            f"decline_all={row['baseline_decline_all_cost']:.4f})"
+        )
+
+    recovered = df.loc[X_test.index, ["AMT_CREDIT", "AMT_ANNUITY"]]
+
+    print("\nPricing validation vs. this dataset's own implied rate (D31):")
+    pricing = pricing_validation(
+        proba,
+        recovered["AMT_CREDIT"].to_numpy(dtype=float),
+        recovered["AMT_ANNUITY"].to_numpy(dtype=float),
+        args.lgd_values,
+        args.margin,
+    )
+    for _, row in pricing.iterrows():
+        print(
+            f"  LGD={row['lgd']:.1f}  median r*={row['median_r_star']:.4f}  "
+            f"median real implied rate={row['median_real_implied_rate']:.4f}  "
+            f"Spearman={row['spearman_corr']:.4f} (p={row['spearman_p_value']:.2e})  "
+            f"n={row['n_applicants']:,} ({row['n_dropped_invalid_amt']} dropped)"
+        )
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+    curve_path = RESULTS_DIR / f"decision_curve_lightgbm_{args.dataset}_{timestamp}.csv"
+    pricing_path = (
+        RESULTS_DIR / f"pricing_validation_lightgbm_{args.dataset}_{timestamp}.csv"
+    )
+    curve.to_csv(curve_path, index=False)
+    pricing.to_csv(pricing_path, index=False)
+    print(f"\nWrote {curve_path}")
+    print(f"Wrote {pricing_path}")
+
+
+if __name__ == "__main__":
+    main()
