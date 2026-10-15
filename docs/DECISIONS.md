@@ -1182,3 +1182,73 @@ price here inherits that) gets physically attached to whatever the
 decision layer outputs — a footnote on a table, a printed line, wherever
 — is a publication/presentation question, decided once real results
 exist, not before.
+
+## D32 — Step 5 real results: beats trivial baselines; pricing correlation is real but negligible (2026-10-15)
+
+Real `scripts/decision_layer.py` output against the held-out test set
+(46,127 rows). `best_iteration=182` on refit, identical to the original
+logged `--final` run (D30/D31) — confirms this refit is the same model,
+not a drifted second copy. Fit on 222,176 of the 261,384 train+val rows
+(the remaining 15% is the early-stopping holdout, D23) — arithmetic
+checks out (261,384 x 0.85 = 222,176.4).
+
+**Approve/decline.** Base rate in the test set: 8.07% (recovered from
+`baseline_decline_all_cost`=0.9193=P(good), identical at every k, as it
+must be). Cost in units of C_FP; k=C_FN/C_FP:
+
+| k | t* | approval rate | realized cost | better trivial baseline | improvement |
+|---|---|---|---|---|---|
+| 3 | 0.2500 | 0.954 | 0.2244 [0.2172, 0.2309] | approve_all 0.2422 | 7.3% |
+| 5 | 0.1667 | 0.890 | 0.3377 [0.3276, 0.3473] | approve_all 0.4037 | 16.3% |
+| 10 | 0.0909 | 0.716 | 0.5261 [0.5119, 0.5419] | approve_all 0.8073 | 34.8% |
+| 20 | 0.0476 | 0.440 | 0.7151 [0.6964, 0.7344] | decline_all 0.9193 | 22.2% |
+
+At every stated cost ratio the model-driven threshold beats the better
+of the two trivial policies, and the margin grows with k. At k=20 the
+trivial baselines themselves flip (decline_all becomes cheaper than
+approve_all — defaults are costly enough that doing nothing beats blind
+approval) and the model still beats both: it isn't just picking the
+better of two bad extremes, it's finding a genuinely better point between
+them. This is the clearest evidence yet that the model carries real
+decision value, not just discriminative ranking in the abstract.
+
+**Pricing.** LGD swept 0.5-1.0, margin fixed at 0.05, n=46,127, 0
+dropped. Spearman rho=0.0816 (p=5.2e-69) between r* and the real
+historical implied rate (`AMT_ANNUITY/AMT_CREDIT`), identical to 3
+decimal places across every LGD value. That identical-across-LGD result
+is not six independent confirmations — it's a direct consequence of the
+formula: for fixed margin, r* is strictly increasing in p for any LGD
+(tested in `test_decision_layer.py`), so the rank order r* induces across
+applicants is exactly p's rank order regardless of LGD. Spearman, being
+rank-based, is therefore invariant to the LGD sweep by construction; only
+the median r* actually moves with LGD (0.139 at LGD=0.5, rising to 0.168
+at LGD=1.0) — that movement, not the correlation, is the sweep's real
+information content.
+
+The substantive finding: rho=0.08 is a real but practically negligible
+correlation. At n=46,127 even a tiny correlation reaches absurd
+statistical significance — p=5.2e-69 is evidence of a large sample, not
+of a strong effect. The median real implied rate sits flat at 0.0500
+regardless of LGD, while r*'s median runs roughly 3x higher (0.14-0.17).
+Two explanations are equally consistent with this data and cannot be
+distinguished without more information, so both are stated rather than
+picking the more interesting-sounding one: either Home Credit's actual
+historical pricing in this dataset isn't meaningfully risk-differentiated
+at the individual level, or `AMT_ANNUITY/AMT_CREDIT` is too confounded by
+loan term/amortization schedule to detect a real risk-pricing
+relationship that exists in the true, unobserved rate (D7's own caveat
+about this ratio).
+
+**"Caveat travels with the result" (deferred in D31, decided now that
+real output exists):** `scripts/decision_layer.py` now prints the D28
+disclosure once in stdout and writes it as the literal first line of both
+output CSVs — a reader can't see a threshold, approval rate, or price
+from this script without also seeing it attached to the same artifact,
+rather than filed separately in SPEC.md where it's easy to miss.
+
+Fixed in the same pass, cosmetic only: `n_applicants`/`n_dropped_invalid_amt`
+printed as e.g. "46127.0"/"0.0" in stdout — `DataFrame.iterrows()` boxes
+each row into one Series, upcasting an int column to float64 whenever
+another column in the same row is a float; the saved CSV column itself
+was always clean int64, only the print loop was affected. Switched both
+print loops to `itertuples()`, which preserves each column's own dtype.
