@@ -299,11 +299,11 @@ def _fit_and_score_fold(
     )
     best_iteration = model.n_estimators_
 
-    train_proba = model.predict_proba(X.iloc[fit_idx])[:, 1]
+    train_proba = np.asarray(model.predict_proba(X.iloc[fit_idx]))[:, 1]
     train_roc = roc_auc_score(y.iloc[fit_idx], train_proba)
     train_pr = average_precision_score(y.iloc[fit_idx], train_proba)
 
-    val_proba = model.predict_proba(X.iloc[val_idx])[:, 1]
+    val_proba = np.asarray(model.predict_proba(X.iloc[val_idx]))[:, 1]
     val_roc = roc_auc_score(y.iloc[val_idx], val_proba)
     val_pr = average_precision_score(y.iloc[val_idx], val_proba)
     raw_brier = brier_score_loss(y.iloc[val_idx], val_proba)
@@ -626,9 +626,15 @@ def evaluate_holdout(
     cis: dict[str, dict[str, tuple[float, float]]] = {}
     curves: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
-    raw_proba = model.predict_proba(X_test)[:, 1]
-    variants["none"], cis["none"], *curve = _test_metrics_and_curve(y_test, raw_proba)
-    curves["none"] = tuple(curve)
+    raw_proba = np.asarray(model.predict_proba(X_test))[:, 1]
+    (
+        variants["none"],
+        cis["none"],
+        mean_pred,
+        observed,
+        counts,
+    ) = _test_metrics_and_curve(y_test, raw_proba)
+    curves["none"] = (mean_pred, observed, counts)
 
     if args.calibration == "isotonic":
         holdout_X = X_train_r.iloc[holdout_idx]
@@ -643,10 +649,14 @@ def evaluate_holdout(
         )
         calibrated.fit(holdout_X, holdout_y)
         cal_proba = calibrated.predict_proba(X_test)[:, 1]
-        variants["isotonic"], cis["isotonic"], *curve = _test_metrics_and_curve(
-            y_test, cal_proba
-        )
-        curves["isotonic"] = tuple(curve)
+        (
+            variants["isotonic"],
+            cis["isotonic"],
+            mean_pred,
+            observed,
+            counts,
+        ) = _test_metrics_and_curve(y_test, cal_proba)
+        curves["isotonic"] = (mean_pred, observed, counts)
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")

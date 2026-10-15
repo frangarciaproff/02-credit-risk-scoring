@@ -152,7 +152,7 @@ def plot_histogram(
         bin_edges = np.logspace(
             np.log10(positive.min()), np.log10(positive.max()), bins
         )
-        ax.hist(positive, bins=bin_edges)
+        ax.hist(positive, bins=bin_edges.tolist())
         ax.set_xscale("log")
     else:
         ax.hist(data, bins=bins)
@@ -178,7 +178,8 @@ def build_report(df: pd.DataFrame) -> str:
         ),
         "=== FLAG_DOCUMENT_*: prevalence and TARGET rate when provided ===\n"
         + document_flags_summary(df, DOCUMENT_FLAGS).to_string(),
-        "=== DOCUMENTS_PROVIDED_COUNT (sum of FLAG_DOCUMENT_*): TARGET rate by value ===\n"
+        "=== DOCUMENTS_PROVIDED_COUNT (sum of FLAG_DOCUMENT_*): TARGET rate by\n"
+        "value ===\n"
         + target_rate_by_value(with_doc_count, "DOCUMENTS_PROVIDED_COUNT").to_string(),
         "=== housing block (_AVG/_MODE/_MEDI) pairwise correlation ===\n"
         + housing_block_correlation(df, HOUSING_ATTRIBUTES).to_string(),

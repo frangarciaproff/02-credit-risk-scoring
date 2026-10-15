@@ -153,12 +153,22 @@ def cost_curve(
         )
         realized_cost = _realized_cost(y_true, proba, t, k)
 
-        approval_rate_ci = _bootstrap_ci(
-            y_true, proba, lambda y, p, _t=t: float((p < _t).mean())
-        )
-        cost_ci = _bootstrap_ci(
-            y_true, proba, lambda y, p, _t=t, _k=k: _realized_cost(y, p, _t, _k)
-        )
+        # Named defs, not lambdas: mypy cannot infer the type of a
+        # lambda carrying extra defaulted params (the default-arg
+        # capture that avoids the classic late-binding closure bug
+        # in a loop) against _bootstrap_ci's Callable[[ndarray,
+        # ndarray], float] parameter -- an explicitly annotated def
+        # has the identical runtime behavior and type-checks cleanly.
+        def _approval_rate_at_t(y: np.ndarray, p: np.ndarray, _t: float = t) -> float:
+            return float((p < _t).mean())
+
+        def _cost_at_t_k(
+            y: np.ndarray, p: np.ndarray, _t: float = t, _k: float = k
+        ) -> float:
+            return _realized_cost(y, p, _t, _k)
+
+        approval_rate_ci = _bootstrap_ci(y_true, proba, _approval_rate_at_t)
+        cost_ci = _bootstrap_ci(y_true, proba, _cost_at_t_k)
 
         rows.append(
             {
@@ -280,7 +290,7 @@ def main() -> None:
     )
     print(f"Fit on {len(fit_idx):,} rows (best_iteration={model.n_estimators_}).")
 
-    proba = model.predict_proba(X_test)[:, 1]
+    proba = np.asarray(model.predict_proba(X_test))[:, 1]
     y_test_arr = np.asarray(y_test)
 
     print("\nApprove/decline cost-ratio sweep (D31):")

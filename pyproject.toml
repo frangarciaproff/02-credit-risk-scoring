@@ -22,6 +22,11 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pre-commit>=3.8",
+    # pytest's terminalwriter unconditionally does `from pygments.lexer
+    # import Lexer`; pygments>=2.21 removed that top-level module (only
+    # `pygments.lexers` survives), breaking pytest startup entirely.
+    # Pin below the break until pytest adapts.
+    "pygments<2.21",
 ]
 
 [tool.ruff]
@@ -32,7 +37,7 @@ target-version = "py311"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 ignore_missing_imports = true
 warn_unused_ignores = true
 

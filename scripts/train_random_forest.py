@@ -404,8 +404,14 @@ def evaluate_holdout(
     raw_model = build_model(args)
     raw_model.fit(X_train, y_train)
     raw_proba = raw_model.predict_proba(X_test)[:, 1]
-    variants["none"], cis["none"], *curve = _test_metrics_and_curve(y_test, raw_proba)
-    curves["none"] = tuple(curve)
+    (
+        variants["none"],
+        cis["none"],
+        mean_pred,
+        observed,
+        counts,
+    ) = _test_metrics_and_curve(y_test, raw_proba)
+    curves["none"] = (mean_pred, observed, counts)
 
     methods_by_flag = {
         "none": [],
@@ -429,8 +435,14 @@ def evaluate_holdout(
         )
         calibrated.fit(X_train, y_train)
         proba = calibrated.predict_proba(X_test)[:, 1]
-        variants[method], cis[method], *curve = _test_metrics_and_curve(y_test, proba)
-        curves[method] = tuple(curve)
+        (
+            variants[method],
+            cis[method],
+            mean_pred,
+            observed,
+            counts,
+        ) = _test_metrics_and_curve(y_test, proba)
+        curves[method] = (mean_pred, observed, counts)
 
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")

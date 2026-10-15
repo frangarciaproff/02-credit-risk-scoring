@@ -2,4 +2,4 @@
 
 
 def main() -> None:
-    raise NotImplementedError  # TODO: implement 
+    raise NotImplementedError  # TODO: implement
