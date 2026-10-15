@@ -163,8 +163,7 @@ ever touched).
   attributes are permitted in credit-risk decisions.
 - The RF-vs-LightGBM comparison above is a point-estimate observation, not
   a statistically tested one (D30).
-- No deployment/serving layer (out of scope — see the separate
-  classifier-service project).
+- No deployment/serving layer (out of scope).
 
 ## Reproducing
 
